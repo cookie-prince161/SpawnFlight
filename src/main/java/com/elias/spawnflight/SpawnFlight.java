@@ -87,7 +87,6 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         jumpHeld.clear();
     }
 
-    // Geändert von isEnabled() zu isPluginEnabled(), um den Konflikt mit JavaPlugin zu lösen
     public boolean isPluginEnabled() {
         return getConfig().getBoolean("enabled", true);
     }
@@ -535,10 +534,8 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
                 if (axis == 0) {
                     options.add(String.valueOf(target.getX()));
                 } else if (axis == 1) {
-                    // Y des angeschauten Blocks und die drei Blöcke darüber
-                    for (int i = 0; i <= 3; i++) {
-                        options.add(String.valueOf(target.getY() + i));
-                    }
+                    // Korrigiert: Nur noch die exakte Y-Koordinate des anvisierten Blocks statt +0 bis +3
+                    options.add(String.valueOf(target.getY()));
                 } else {
                     options.add(String.valueOf(target.getZ()));
                 }
