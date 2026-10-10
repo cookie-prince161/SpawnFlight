@@ -11,6 +11,7 @@ import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -21,16 +22,23 @@ import org.bukkit.event.player.PlayerSwapHandItemsEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
-public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor {
+public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     // Mindesthöhe der Zone: darunter gibt es eine rote Warnung im Chat
     private static final int MIN_HEIGHT = 3;
+
+    private static final String[] SUBCOMMANDS = {
+            "enable", "disable", "pos1", "pos2", "info", "remove",
+            "boost", "boosts", "cooldown", "duration"
+    };
 
     // Zustand pro Spieler
     private static final class State {
@@ -39,6 +47,8 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         boolean gliding;    // laufender Flug (gestartet durch dieses Plugin)
         int boostsUsed;     // Boosts in diesem Flug
         long lastBoost;     // Zeitpunkt des letzten Boosts
+        long boostUntil;    // bis wann der Dauerschub läuft
+        long lastBar;       // wann die Boost-Anzeige zuletzt gesendet wurde
     }
 
     private final Map<UUID, State> states = new HashMap<>();
@@ -52,9 +62,11 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
 
     @Override
     public void onEnable() {
-        getConfig().addDefault("boost-strength", 1.5);
+        getConfig().addDefault("enabled", true);
+        getConfig().addDefault("boost-strength", 2.5);
         getConfig().addDefault("boosts-per-flight", 3);
         getConfig().addDefault("boost-cooldown-seconds", 2.0);
+        getConfig().addDefault("boost-duration-seconds", 1.2);
         getConfig().addDefault("outside-window-seconds", 4.0);
         getConfig().options().copyDefaults(true);
         saveConfig();
@@ -62,8 +74,10 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         rebuildZone();
 
         getServer().getPluginManager().registerEvents(this, this);
-        getCommand("flugzone").setExecutor(this);
+        getCommand("elytrazone").setExecutor(this);
+        getCommand("elytrazone").setTabCompleter(this);
         Bukkit.getScheduler().runTaskTimer(this, this::tick, 20L, 2L);
+        Bukkit.getScheduler().runTaskTimer(this, this::boostTick, 20L, 1L);
         getLogger().info("SpawnFlight aktiviert.");
     }
 
@@ -71,6 +85,10 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
     public void onDisable() {
         states.clear();
         jumpHeld.clear();
+    }
+
+    private boolean isEnabled() {
+        return getConfig().getBoolean("enabled", true);
     }
 
     // ===== Zone =====
@@ -116,8 +134,6 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
                 && z >= minZ && z <= maxZ;
     }
 
-    // ===== Berechtigung =====
-
     private boolean isSurvivalLike(Player p) {
         GameMode mode = p.getGameMode();
         return mode == GameMode.SURVIVAL || mode == GameMode.ADVENTURE;
@@ -126,6 +142,12 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
     // ===== Regelmäßige Prüfung (alle 2 Ticks) =====
 
     private void tick() {
+        if (!isEnabled()) {
+            if (!states.isEmpty()) {
+                states.clear();
+            }
+            return;
+        }
         long now = System.currentTimeMillis();
         for (Player p : Bukkit.getOnlinePlayers()) {
             updatePlayer(p, now);
@@ -153,12 +175,17 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
             states.put(id, st);
         }
 
-        // Laufender Flug: nichts tun, bis der Server das Gleiten beendet (Landung)
+        // Laufender Flug: Anzeige aktualisieren, sonst nichts tun bis zur Landung
         if (st.gliding) {
             if (p.isGliding()) {
+                if (now - st.lastBar > 1000) {
+                    showBoosts(p, st);
+                    st.lastBar = now;
+                }
                 return;
             }
             st.gliding = false;
+            st.boostUntil = 0;
         }
 
         boolean inVehicle = p.isInsideVehicle();
@@ -183,6 +210,39 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         }
     }
 
+    // ===== Dauerschub beim Boost (jeden Tick) =====
+
+    private void boostTick() {
+        if (states.isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        double strength = getConfig().getDouble("boost-strength", 2.5);
+        for (Map.Entry<UUID, State> entry : states.entrySet()) {
+            State st = entry.getValue();
+            if (st.boostUntil <= now) {
+                continue;
+            }
+            Player p = Bukkit.getPlayer(entry.getKey());
+            if (p == null || !p.isGliding()) {
+                st.boostUntil = 0;
+                continue;
+            }
+            p.setVelocity(p.getLocation().getDirection().normalize().multiply(strength));
+        }
+    }
+
+    // Zeigt unten in Grau die verbleibenden Boosts (nur bei 2 oder mehr Boosts pro Flug)
+    private void showBoosts(Player p, State st) {
+        int max = getConfig().getInt("boosts-per-flight", 3);
+        if (max <= 1) {
+            return;
+        }
+        int left = Math.max(0, max - st.boostsUsed);
+        p.spigot().sendMessage(ChatMessageType.ACTION_BAR,
+                new TextComponent(ChatColor.GRAY + "Boosts: " + left));
+    }
+
     // ===== Flugstart: Sprung in der Luft =====
 
     @EventHandler
@@ -199,7 +259,7 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
             jumpHeld.remove(id);
         }
         boolean newPress = jump && !wasHeld;
-        if (!newPress) {
+        if (!newPress || !isEnabled()) {
             return;
         }
 
@@ -219,12 +279,16 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
     }
 
     private void startGlide(Player p, State st) {
+        long now = System.currentTimeMillis();
         st.gliding = true;
         st.boostsUsed = 0;
         st.lastBoost = 0;
+        st.boostUntil = 0;
         st.armed = false; // Berechtigung ist verbraucht
         st.outsideSince = 0;
         p.setGliding(true);
+        showBoosts(p, st);
+        st.lastBar = now;
     }
 
     // ===== Gleiten nicht abschalten lassen, solange der Spieler in der Luft ist =====
@@ -266,30 +330,26 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
 
         long now = System.currentTimeMillis();
         long cooldownMs = (long) (getConfig().getDouble("boost-cooldown-seconds", 2.0) * 1000);
+        long durationMs = (long) (getConfig().getDouble("boost-duration-seconds", 1.2) * 1000);
         int maxBoosts = getConfig().getInt("boosts-per-flight", 3);
 
         if (cooldownMs > 0 && now - st.lastBoost < cooldownMs) {
             return;
         }
         if (maxBoosts > 0 && st.boostsUsed >= maxBoosts) {
-            p.spigot().sendMessage(ChatMessageType.ACTION_BAR,
-                    new TextComponent(ChatColor.RED + "Keine Boosts mehr in diesem Flug"));
             return;
         }
 
-        double strength = getConfig().getDouble("boost-strength", 1.5);
-        Vector direction = p.getLocation().getDirection().normalize();
-        p.setVelocity(direction.multiply(strength));
+        double strength = getConfig().getDouble("boost-strength", 2.5);
+        p.setVelocity(p.getLocation().getDirection().normalize().multiply(strength));
         p.playSound(p.getLocation(), Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 1.0f, 1.0f);
 
+        st.boostUntil = now + durationMs;
         st.boostsUsed++;
         st.lastBoost = now;
 
-        if (maxBoosts > 0) {
-            int left = maxBoosts - st.boostsUsed;
-            p.spigot().sendMessage(ChatMessageType.ACTION_BAR,
-                    new TextComponent(ChatColor.GREEN + "Boost! Noch " + left + " übrig"));
-        }
+        showBoosts(p, st);
+        st.lastBar = now;
     }
 
     // ===== Aufräumen beim Ausloggen =====
@@ -303,12 +363,11 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
 
     // ===== Befehle =====
 
-    private void savePos(String name, Player p) {
-        Location loc = p.getLocation();
-        getConfig().set(name + ".world", loc.getWorld().getName());
-        getConfig().set(name + ".x", loc.getBlockX());
-        getConfig().set(name + ".y", loc.getBlockY());
-        getConfig().set(name + ".z", loc.getBlockZ());
+    private void savePos(String name, String world, int x, int y, int z) {
+        getConfig().set(name + ".world", world);
+        getConfig().set(name + ".x", x);
+        getConfig().set(name + ".y", y);
+        getConfig().set(name + ".z", z);
         saveConfig();
         rebuildZone();
     }
@@ -330,14 +389,39 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         }
     }
 
+    // Koordinate lesen: Zahl oder ~ bzw. ~Zahl (relativ zur eigenen Position)
+    private static int parseCoord(String text, int base) {
+        if (text.startsWith("~")) {
+            String rest = text.substring(1);
+            if (rest.isEmpty()) {
+                return base;
+            }
+            return base + (int) Math.floor(Double.parseDouble(rest.replace(',', '.')));
+        }
+        return (int) Math.floor(Double.parseDouble(text.replace(',', '.')));
+    }
+
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
             sender.sendMessage(ChatColor.YELLOW
-                    + "Benutzung: /flugzone <pos1|pos2|info|remove|boost <Wert>|boosts <Anzahl>|cooldown <Sekunden>>");
+                    + "Benutzung: /elytrazone <enable|disable|pos1|pos2|info|remove|boost|boosts|cooldown|duration>");
             return true;
         }
         String sub = args[0].toLowerCase();
+
+        if (sub.equals("enable") || sub.equals("disable")) {
+            boolean on = sub.equals("enable");
+            getConfig().set("enabled", on);
+            saveConfig();
+            if (!on) {
+                states.clear();
+            }
+            sender.sendMessage(on
+                    ? ChatColor.GREEN + "SpawnFlight ist jetzt aktiviert."
+                    : ChatColor.YELLOW + "SpawnFlight ist jetzt deaktiviert.");
+            return true;
+        }
 
         if (sub.equals("pos1") || sub.equals("pos2")) {
             if (!(sender instanceof Player)) {
@@ -345,17 +429,38 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
                 return true;
             }
             Player p = (Player) sender;
-            savePos(sub, p);
-            sender.sendMessage(ChatColor.GREEN + sub + " gesetzt auf deine Position ("
-                    + p.getLocation().getBlockX() + ", " + p.getLocation().getBlockY() + ", "
-                    + p.getLocation().getBlockZ() + ").");
+            Location loc = p.getLocation();
+            int x = loc.getBlockX();
+            int y = loc.getBlockY();
+            int z = loc.getBlockZ();
+
+            if (args.length == 4) {
+                try {
+                    x = parseCoord(args[1], x);
+                    y = parseCoord(args[2], y);
+                    z = parseCoord(args[3], z);
+                } catch (NumberFormatException e) {
+                    sender.sendMessage(ChatColor.RED + "Ungültige Koordinaten.");
+                    return true;
+                }
+            } else if (args.length != 1) {
+                sender.sendMessage(ChatColor.RED + "Benutzung: /elytrazone " + sub + " [x y z]");
+                return true;
+            }
+
+            savePos(sub, p.getWorld().getName(), x, y, z);
+            sender.sendMessage(ChatColor.GREEN + sub + " gesetzt auf " + x + ", " + y + ", " + z + ".");
             zoneMessage(sender);
             return true;
         }
 
         if (sub.equals("info")) {
+            sender.sendMessage(isEnabled()
+                    ? ChatColor.GREEN + "Status: aktiviert"
+                    : ChatColor.YELLOW + "Status: deaktiviert");
             zoneMessage(sender);
-            sender.sendMessage(ChatColor.GRAY + "Boost-Stärke: " + getConfig().getDouble("boost-strength", 1.5)
+            sender.sendMessage(ChatColor.GRAY + "Boost-Stärke: " + getConfig().getDouble("boost-strength", 2.5)
+                    + " | Dauer: " + getConfig().getDouble("boost-duration-seconds", 1.2) + " s"
                     + " | Boosts pro Flug: " + getConfig().getInt("boosts-per-flight", 3)
                     + " (0 = unbegrenzt) | Pause: " + getConfig().getDouble("boost-cooldown-seconds", 2.0)
                     + " s");
@@ -371,9 +476,9 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
             return true;
         }
 
-        if (sub.equals("boost") || sub.equals("boosts") || sub.equals("cooldown")) {
+        if (sub.equals("boost") || sub.equals("boosts") || sub.equals("cooldown") || sub.equals("duration")) {
             if (args.length < 2) {
-                sender.sendMessage(ChatColor.RED + "Bitte einen Wert angeben, z. B. /flugzone " + sub + " 2");
+                sender.sendMessage(ChatColor.RED + "Bitte einen Wert angeben, z. B. /elytrazone " + sub + " 2");
                 return true;
             }
             try {
@@ -386,8 +491,10 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
                     getConfig().set("boost-strength", value);
                 } else if (sub.equals("boosts")) {
                     getConfig().set("boosts-per-flight", (int) value);
-                } else {
+                } else if (sub.equals("cooldown")) {
                     getConfig().set("boost-cooldown-seconds", value);
+                } else {
+                    getConfig().set("boost-duration-seconds", value);
                 }
                 saveConfig();
                 sender.sendMessage(ChatColor.GREEN + "Gespeichert: " + sub + " = " + value);
@@ -399,5 +506,49 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
 
         sender.sendMessage(ChatColor.RED + "Unbekannter Unterbefehl.");
         return true;
+    }
+
+    // ===== Tab-Vervollständigung =====
+
+    @Override
+    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        List<String> result = new ArrayList<>();
+        String typed = args[args.length - 1].toLowerCase();
+
+        if (args.length == 1) {
+            for (String sub : SUBCOMMANDS) {
+                if (sub.startsWith(typed)) {
+                    result.add(sub);
+                }
+            }
+            return result;
+        }
+
+        boolean isPos = args[0].equalsIgnoreCase("pos1") || args[0].equalsIgnoreCase("pos2");
+        if (isPos && args.length >= 2 && args.length <= 4 && sender instanceof Player) {
+            Player p = (Player) sender;
+            Block target = p.getTargetBlockExact(120);
+            int axis = args.length - 2; // 0 = x, 1 = y, 2 = z
+            List<String> options = new ArrayList<>();
+            if (target != null) {
+                if (axis == 0) {
+                    options.add(String.valueOf(target.getX()));
+                } else if (axis == 1) {
+                    // Y des angeschauten Blocks und die drei Blöcke darüber
+                    for (int i = 0; i <= 3; i++) {
+                        options.add(String.valueOf(target.getY() + i));
+                    }
+                } else {
+                    options.add(String.valueOf(target.getZ()));
+                }
+            }
+            options.add("~");
+            for (String option : options) {
+                if (option.toLowerCase().startsWith(typed)) {
+                    result.add(option);
+                }
+            }
+        }
+        return result;
     }
 }
