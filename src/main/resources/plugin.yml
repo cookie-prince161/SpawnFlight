@@ -1,0 +1,15 @@
+name: SpawnFlight
+version: 1.0.0
+main: com.elias.spawnflight.SpawnFlight
+api-version: '26.1'
+description: Flugzone mit Gleiten ohne Elytra und Boost per F-Taste.
+
+commands:
+  flugzone:
+    description: Verwaltet die Flugzone und ihre Einstellungen
+    usage: /flugzone <pos1|pos2|info|remove|boost|boosts|cooldown>
+    permission: spawnflight.admin
+
+permissions:
+  spawnflight.admin:
+    default: op
