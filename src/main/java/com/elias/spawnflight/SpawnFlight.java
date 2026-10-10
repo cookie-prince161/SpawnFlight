@@ -87,7 +87,8 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         jumpHeld.clear();
     }
 
-    public boolean isEnabled() {
+    // Geändert von isEnabled() zu isPluginEnabled(), um den Konflikt mit JavaPlugin zu lösen
+    public boolean isPluginEnabled() {
         return getConfig().getBoolean("enabled", true);
     }
 
@@ -142,7 +143,7 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
     // ===== Regelmäßige Prüfung (alle 2 Ticks) =====
 
     private void tick() {
-        if (!isEnabled()) {
+        if (!isPluginEnabled()) {
             if (!states.isEmpty()) {
                 states.clear();
             }
@@ -259,7 +260,7 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
             jumpHeld.remove(id);
         }
         boolean newPress = jump && !wasHeld;
-        if (!newPress || !isEnabled()) {
+        if (!newPress || !isPluginEnabled()) {
             return;
         }
 
@@ -455,7 +456,7 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         }
 
         if (sub.equals("info")) {
-            sender.sendMessage(isEnabled()
+            sender.sendMessage(isPluginEnabled()
                     ? ChatColor.GREEN + "Status: aktiviert"
                     : ChatColor.YELLOW + "Status: deaktiviert");
             zoneMessage(sender);
