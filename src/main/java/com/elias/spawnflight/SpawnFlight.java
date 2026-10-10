@@ -6,7 +6,6 @@ import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
-import org.bukkit.NamespacedKey;
 import org.bukkit.Sound;
 import org.bukkit.block.Block;
 import org.bukkit.command.Command;
@@ -16,32 +15,35 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityToggleGlideEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerInputEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerSwapHandItemsEvent;
-import org.bukkit.event.player.PlayerToggleFlightEvent;
-import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor {
 
+    // Mindesthöhe der Zone: darunter gibt es eine rote Warnung im Chat
+    private static final int MIN_HEIGHT = 3;
+
     // Zustand pro Spieler
     private static final class State {
-        boolean armed;          // darf per Doppelsprung losgleiten
-        long outsideSince;      // seit wann außerhalb der Zone (0 = innerhalb)
-        boolean gliding;        // laufender Flug (gestartet durch dieses Plugin)
-        int boostsUsed;         // Boosts in diesem Flug
-        long lastBoost;         // Zeitpunkt des letzten Boosts
-        boolean hadAllowFlight; // Flugrecht des Spielers vor der Berechtigung
+        boolean armed;      // darf mit einem Sprung in der Luft losgleiten
+        long outsideSince;  // seit wann außerhalb der Zone (0 = innerhalb)
+        boolean gliding;    // laufender Flug (gestartet durch dieses Plugin)
+        int boostsUsed;     // Boosts in diesem Flug
+        long lastBoost;     // Zeitpunkt des letzten Boosts
     }
 
     private final Map<UUID, State> states = new HashMap<>();
-    private NamespacedKey armedKey;
+    // Spieler, die gerade die Sprungtaste gedrückt halten
+    private final Set<UUID> jumpHeld = new HashSet<>();
 
     // Zone (aus pos1 und pos2 berechnet)
     private boolean zoneSet;
@@ -50,20 +52,14 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
 
     @Override
     public void onEnable() {
-        armedKey = new NamespacedKey(this, "armed");
-
         getConfig().addDefault("boost-strength", 1.5);
         getConfig().addDefault("boosts-per-flight", 3);
         getConfig().addDefault("boost-cooldown-seconds", 2.0);
         getConfig().addDefault("outside-window-seconds", 4.0);
-        getConfig().addDefault("min-height", 3);
         getConfig().options().copyDefaults(true);
         saveConfig();
 
         rebuildZone();
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            cleanupLeftover(p);
-        }
 
         getServer().getPluginManager().registerEvents(this, this);
         getCommand("flugzone").setExecutor(this);
@@ -73,13 +69,8 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
 
     @Override
     public void onDisable() {
-        for (Player p : Bukkit.getOnlinePlayers()) {
-            State st = states.get(p.getUniqueId());
-            if (st != null) {
-                disarm(p, st);
-            }
-        }
         states.clear();
+        jumpHeld.clear();
     }
 
     // ===== Zone =====
@@ -109,12 +100,6 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         minZ = Math.min(z1, z2);
         maxZ = Math.max(z1, z2);
 
-        // Mindesthöhe der Zone (Standard 3 Blöcke)
-        int minHeight = Math.max(1, getConfig().getInt("min-height", 3));
-        if (maxY - minY + 1 < minHeight) {
-            maxY = minY + minHeight - 1;
-        }
-
         zoneWorld = world1;
         zoneSet = true;
     }
@@ -131,55 +116,11 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
                 && z >= minZ && z <= maxZ;
     }
 
-    // ===== Berechtigung (Flugrecht) =====
+    // ===== Berechtigung =====
 
     private boolean isSurvivalLike(Player p) {
         GameMode mode = p.getGameMode();
         return mode == GameMode.SURVIVAL || mode == GameMode.ADVENTURE;
-    }
-
-    // Spieler bekommt die Berechtigung: Doppelsprung startet den Flug
-    private void arm(Player p, State st) {
-        if (st.armed) {
-            return;
-        }
-        st.armed = true;
-        st.hadAllowFlight = p.getAllowFlight();
-        // Merken, damit nach einem Absturz oder Neustart aufgeräumt werden kann
-        p.getPersistentDataContainer().set(armedKey, PersistentDataType.BYTE,
-                (byte) (st.hadAllowFlight ? 1 : 0));
-        p.setAllowFlight(true);
-    }
-
-    // Berechtigung entziehen und das ursprüngliche Flugrecht wiederherstellen
-    private void disarm(Player p, State st) {
-        if (!st.armed) {
-            return;
-        }
-        st.armed = false;
-        st.outsideSince = 0;
-        p.getPersistentDataContainer().remove(armedKey);
-        restoreFlight(p, st.hadAllowFlight);
-    }
-
-    private void restoreFlight(Player p, boolean hadAllowFlight) {
-        if (hadAllowFlight || !isSurvivalLike(p)) {
-            return; // Creative/Spectator und fremde Flugrechte nicht anfassen
-        }
-        p.setFlying(false);
-        p.setAllowFlight(false);
-    }
-
-    // Räumt Reste auf, falls der Server mit gesetzter Berechtigung gestoppt wurde
-    private void cleanupLeftover(Player p) {
-        Byte had = p.getPersistentDataContainer().get(armedKey, PersistentDataType.BYTE);
-        if (had == null) {
-            return;
-        }
-        p.getPersistentDataContainer().remove(armedKey);
-        if (had.byteValue() == 0) {
-            restoreFlight(p, false);
-        }
     }
 
     // ===== Regelmäßige Prüfung (alle 2 Ticks) =====
@@ -198,7 +139,6 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         // Nicht zuständig: Zone fehlt, anderer Spielmodus oder Spieler tot
         if (!zoneSet || !isSurvivalLike(p) || p.isDead()) {
             if (st != null) {
-                disarm(p, st);
                 states.remove(id);
             }
             return;
@@ -224,7 +164,7 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         boolean inVehicle = p.isInsideVehicle();
         if (inZone && !inVehicle) {
             st.outsideSince = 0;
-            arm(p, st);
+            st.armed = true;
         } else if (st.armed) {
             if (st.outsideSince == 0) {
                 st.outsideSince = now;
@@ -233,7 +173,8 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
             boolean onGround = p.isOnGround();
             boolean inLiquid = p.getLocation().getBlock().isLiquid();
             if (onGround || inLiquid || inVehicle || now - st.outsideSince > windowMs) {
-                disarm(p, st);
+                st.armed = false;
+                st.outsideSince = 0;
             }
         }
 
@@ -242,26 +183,38 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         }
     }
 
-    // ===== Flugstart per Doppelsprung =====
+    // ===== Flugstart: Sprung in der Luft =====
 
     @EventHandler
-    public void onToggleFlight(PlayerToggleFlightEvent event) {
+    public void onInput(PlayerInputEvent event) {
         Player p = event.getPlayer();
-        State st = states.get(p.getUniqueId());
-        if (st == null || !st.armed || !isSurvivalLike(p)) {
-            return; // nicht unser Fall
+        UUID id = p.getUniqueId();
+
+        // Neuer Druck auf die Sprungtaste (vorher nicht gedrückt)
+        boolean jump = event.getInput().isJump();
+        boolean wasHeld = jumpHeld.contains(id);
+        if (jump) {
+            jumpHeld.add(id);
+        } else {
+            jumpHeld.remove(id);
         }
-        if (!event.isFlying()) {
+        boolean newPress = jump && !wasHeld;
+        if (!newPress) {
             return;
         }
 
-        // Normales Creative-Fliegen verhindern, wir starten stattdessen das Gleiten
-        event.setCancelled(true);
-        p.setFlying(false);
-
-        if (p.isOnGround() || p.isInsideVehicle()) {
-            return; // Start nur in der Luft
+        State st = states.get(id);
+        if (st == null || !st.armed || st.gliding) {
+            return;
         }
+        if (!isSurvivalLike(p) || p.isDead()) {
+            return;
+        }
+        // Nur in der Luft: nicht am Boden, nicht im Wasser, nicht im Fahrzeug
+        if (p.isOnGround() || p.isInsideVehicle() || p.getLocation().getBlock().isLiquid()) {
+            return;
+        }
+
         startGlide(p, st);
     }
 
@@ -269,9 +222,9 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         st.gliding = true;
         st.boostsUsed = 0;
         st.lastBoost = 0;
-        disarm(p, st); // Berechtigung ist verbraucht, Flugrecht wieder aus
+        st.armed = false; // Berechtigung ist verbraucht
+        st.outsideSince = 0;
         p.setGliding(true);
-        p.setVelocity(p.getVelocity().add(new Vector(0, 0.4, 0)));
     }
 
     // ===== Gleiten nicht abschalten lassen, solange der Spieler in der Luft ist =====
@@ -339,20 +292,13 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         }
     }
 
-    // ===== Aufräumen beim Ein- und Ausloggen =====
-
-    @EventHandler
-    public void onJoin(PlayerJoinEvent event) {
-        cleanupLeftover(event.getPlayer());
-    }
+    // ===== Aufräumen beim Ausloggen =====
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        Player p = event.getPlayer();
-        State st = states.remove(p.getUniqueId());
-        if (st != null) {
-            disarm(p, st);
-        }
+        UUID id = event.getPlayer().getUniqueId();
+        states.remove(id);
+        jumpHeld.remove(id);
     }
 
     // ===== Befehle =====
@@ -368,19 +314,27 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
     }
 
     private void zoneMessage(CommandSender sender) {
-        if (zoneSet) {
-            sender.sendMessage(ChatColor.GREEN + "Zone aktiv: X " + minX + " bis " + maxX
-                    + ", Y " + minY + " bis " + maxY + ", Z " + minZ + " bis " + maxZ
-                    + " (Welt " + zoneWorld + ")");
-        } else {
-            sender.sendMessage(ChatColor.YELLOW + "Die Zone ist noch nicht komplett (pos1 und pos2 in derselben Welt nötig).");
+        if (!zoneSet) {
+            sender.sendMessage(ChatColor.YELLOW
+                    + "Die Zone ist noch nicht komplett (pos1 und pos2 in derselben Welt nötig).");
+            return;
+        }
+        int height = maxY - minY + 1;
+        sender.sendMessage(ChatColor.GREEN + "Zone aktiv: X " + minX + " bis " + maxX
+                + ", Y " + minY + " bis " + maxY + ", Z " + minZ + " bis " + maxZ
+                + " (Welt " + zoneWorld + "), Höhe " + height + " Blöcke");
+        if (height < MIN_HEIGHT) {
+            sender.sendMessage(ChatColor.RED + "Achtung: Die Zone ist nur " + height
+                    + " Block(e) hoch. Empfohlen sind mindestens " + MIN_HEIGHT
+                    + " Blöcke, sonst verlässt man sie schon beim Springen.");
         }
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage(ChatColor.YELLOW + "Benutzung: /flugzone <pos1|pos2|info|remove|boost <Wert>|boosts <Anzahl>|cooldown <Sekunden>>");
+            sender.sendMessage(ChatColor.YELLOW
+                    + "Benutzung: /flugzone <pos1|pos2|info|remove|boost <Wert>|boosts <Anzahl>|cooldown <Sekunden>>");
             return true;
         }
         String sub = args[0].toLowerCase();
