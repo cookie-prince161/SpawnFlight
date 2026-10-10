@@ -87,7 +87,7 @@ public class SpawnFlight extends JavaPlugin implements Listener, CommandExecutor
         jumpHeld.clear();
     }
 
-    private boolean isEnabled() {
+    public boolean isEnabled() {
         return getConfig().getBoolean("enabled", true);
     }
 
